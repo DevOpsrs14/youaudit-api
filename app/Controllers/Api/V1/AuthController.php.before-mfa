@@ -1,0 +1,105 @@
+<?php
+
+namespace App\Controllers\Api\V1;
+
+use App\Services\AuthService;
+use App\Services\SessionService;
+
+class AuthController extends BaseApiController
+{
+    public function login()
+    {
+        $data = $this->request->getJSON(true);
+
+        // Also allow normal POST form data while testing.
+        if (!is_array($data)) {
+            $data = $this->request->getPost();
+        }
+
+        $username = trim((string) ($data['username'] ?? ''));
+        $password = (string) ($data['password'] ?? '');
+
+        if ($username === '' || $password === '') {
+            return $this->error(
+                'Username and password are required',
+                400
+            );
+        }
+
+        $authService = new AuthService();
+        $result = $authService->authenticate($username, $password);
+
+        if (!$result['success']) {
+            if ($result['reason'] === 'access_denied') {
+                return $this->error(
+                    'You do not have permission to access this application',
+                    403
+                );
+            }
+
+            return $this->error(
+                'Invalid username or password',
+                401
+            );
+        }
+
+        $user = $result['user'];
+
+        $deviceName = isset($data['device_name'])
+            ? trim((string) $data['device_name'])
+            : null;
+
+        $platform = isset($data['platform'])
+            ? trim((string) $data['platform'])
+            : null;
+
+        $appVersion = isset($data['app_version'])
+            ? trim((string) $data['app_version'])
+            : null;
+
+        $sessionService = new SessionService();
+
+        $session = $sessionService->createSession(
+            (int) $user['id'],
+            $deviceName ?: null,
+            $platform ?: null,
+            $appVersion ?: null
+        );
+
+        return $this->success([
+            'user' => $user,
+            'session' => [
+                'token'      => $session['token'],
+                'expires_at' => $session['expires_at'],
+            ],
+        ], 'Login successful');
+    }
+
+    public function logout()
+    {
+        $sessionId = (int) $this->request->authSessionId;
+
+        if ($sessionId <= 0) {
+            return $this->error(
+                'Invalid session',
+                401
+            );
+        }
+
+        $sessionService = new SessionService();
+
+        $revoked = $sessionService->revokeSession($sessionId);
+
+        if (!$revoked) {
+            return $this->error(
+                'Session could not be revoked',
+                400
+            );
+        }
+
+        return $this->success(
+            null,
+            'Logout successful'
+        );
+    }
+}

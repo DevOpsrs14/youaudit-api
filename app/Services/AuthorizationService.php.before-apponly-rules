@@ -1,0 +1,266 @@
+<?php
+
+namespace App\Services;
+
+use Config\Database;
+
+class AuthorizationService
+{
+    private $db;
+
+    public function __construct()
+    {
+        $this->db = Database::connect();
+    }
+
+    /**
+     * Check whether a user has a legacy named permission.
+     *
+     * Levels 1-4 use the existing database permission mapping.
+     * AppOnly roles 5, 6 and 7 currently have no rows in
+     * levels_permissions_link and are handled separately by V1
+     * capability rules where those rules have been verified.
+     */
+    public function hasLegacyPermission(
+        int $userId,
+        string $permissionName
+    ): bool {
+        if ($userId <= 0 || $permissionName === '') {
+            return false;
+        }
+
+        $row = $this->db->table('users u')
+            ->select('p.id')
+            ->join('levels l', 'l.id = u.level_id', 'inner')
+            ->join(
+                'levels_permissions_link lpl',
+                'lpl.level_id = l.id',
+                'inner'
+            )
+            ->join(
+                'permissions p',
+                'p.id = lpl.permission_id',
+                'inner'
+            )
+            ->where('u.id', $userId)
+            ->where('u.active', 1)
+            ->where('p.name', $permissionName)
+            ->limit(1)
+            ->get()
+            ->getRowArray();
+
+        return $row !== null;
+    }
+
+    /**
+     * Return all legacy named permissions assigned to the user's level.
+     */
+    public function getLegacyPermissionsForUser(int $userId): array
+    {
+        if ($userId <= 0) {
+            return [];
+        }
+
+        $rows = $this->db->table('users u')
+            ->select('p.name')
+            ->join('levels l', 'l.id = u.level_id', 'inner')
+            ->join(
+                'levels_permissions_link lpl',
+                'lpl.level_id = l.id',
+                'inner'
+            )
+            ->join(
+                'permissions p',
+                'p.id = lpl.permission_id',
+                'inner'
+            )
+            ->where('u.id', $userId)
+            ->where('u.active', 1)
+            ->orderBy('p.name', 'ASC')
+            ->get()
+            ->getResultArray();
+
+        $permissions = [];
+
+        foreach ($rows as $row) {
+            if (!empty($row['name'])) {
+                $permissions[] = $row['name'];
+            }
+        }
+
+        return array_values(array_unique($permissions));
+    }
+
+    /**
+     * Check a V1 capability.
+     *
+     * Unknown or unverified capabilities are denied by default.
+     *
+     * The API remains the security boundary.
+     * Swift/Web can use capabilities for UI visibility,
+     * but must not be trusted to enforce authorization.
+     */
+    public function can(int $userId, string $capability): bool
+    {
+        if ($userId <= 0 || $capability === '') {
+            return false;
+        }
+
+        $user = $this->getActiveYouAuditUser($userId);
+
+        if ($user === null) {
+            return false;
+        }
+
+        $levelId = (int) $user['level_id'];
+
+        switch ($capability) {
+            case 'items.view':
+                return $this->canViewItems($userId, $levelId);
+
+            case 'items.add':
+                return $this->canAddItems($userId, $levelId);
+
+            case 'items.edit':
+                return $this->canEditItems($userId, $levelId);
+
+            case 'items.archive':
+                return $this->canArchiveItems($userId, $levelId);
+
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Return the currently verified V1 capability set.
+     *
+     * More capabilities will be added only after their
+     * legacy behaviour has been traced and verified.
+     */
+    public function getCapabilitiesForUser(int $userId): array
+    {
+        return [
+            'items.view'    => $this->can($userId, 'items.view'),
+            'items.add'     => $this->can($userId, 'items.add'),
+            'items.edit'    => $this->can($userId, 'items.edit'),
+            'items.archive' => $this->can($userId, 'items.archive'),
+        ];
+    }
+
+    /**
+     * Load the minimum identity required for authorization.
+     *
+     * Only an active YouAudit user can receive UAsset capabilities.
+     */
+    private function getActiveYouAuditUser(int $userId): ?array
+    {
+        $user = $this->db->table('users')
+            ->select([
+                'id',
+                'level_id',
+                'active',
+                'youaudit',
+            ])
+            ->where('id', $userId)
+            ->where('active', 1)
+            ->where('youaudit', 1)
+            ->get()
+            ->getRowArray();
+
+        return $user ?: null;
+    }
+
+    /**
+     * ITEMS - VIEW
+     *
+     * Legacy web behaviour does not use an Items.view permission.
+     *
+     * An authenticated active YouAudit user may enter the item-view
+     * flow. Access to an individual item must still be scoped to an
+     * account the authenticated user is authorised to access.
+     *
+     * Legacy single-account behaviour scopes the item using:
+     * item ID + the user's account ID.
+     *
+     * Account/item scoping must be enforced by the item endpoint/data
+     * layer and must not rely on this UI capability alone.
+     */
+    private function canViewItems(int $userId, int $levelId): bool
+    {
+        return $levelId >= 1 && $levelId <= 7;
+    }
+
+    /**
+     * ITEMS - ADD
+     *
+     * Levels 1-4:
+     * Uses the verified legacy Items.addOne permission.
+     *
+     * AppOnly roles:
+     * Denied until their add-item behaviour is separately verified.
+     */
+    private function canAddItems(int $userId, int $levelId): bool
+    {
+        if ($levelId >= 1 && $levelId <= 4) {
+            return $this->hasLegacyPermission(
+                $userId,
+                'Items.addOne'
+            );
+        }
+
+        return false;
+    }
+
+    /**
+     * ITEMS - EDIT
+     *
+     * Levels 1-4:
+     * Uses the verified legacy Items.editOne permission.
+     *
+     * Level 5 AppOnly:
+     * Existing iOS Item screen permits Edit.
+     *
+     * Levels 6 and 7:
+     * Existing iOS Item screen does not expose normal Edit.
+     */
+    private function canEditItems(int $userId, int $levelId): bool
+    {
+        if ($levelId >= 1 && $levelId <= 4) {
+            return $this->hasLegacyPermission(
+                $userId,
+                'Items.editOne'
+            );
+        }
+
+        if ($levelId === 5) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * ITEMS - ARCHIVE
+     *
+     * Levels 1-4:
+     * Uses the verified legacy Items.markDeleted permission.
+     *
+     * Level 5 AppOnly:
+     * Existing mobile dashboard removes Archive / Remove Items.
+     *
+     * Levels 6 and 7:
+     * Denied until archive behaviour is explicitly verified.
+     */
+    private function canArchiveItems(int $userId, int $levelId): bool
+    {
+        if ($levelId >= 1 && $levelId <= 4) {
+            return $this->hasLegacyPermission(
+                $userId,
+                'Items.markDeleted'
+            );
+        }
+
+        return false;
+    }
+}

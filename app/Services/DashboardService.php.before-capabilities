@@ -1,0 +1,95 @@
+<?php
+
+namespace App\Services;
+
+use Config\Database;
+
+class DashboardService
+{
+    private $db;
+
+    public function __construct()
+    {
+        $this->db = Database::connect();
+    }
+
+    public function getDashboardForUser(int $userId): ?array
+    {
+        $user = $this->db->table('users u')
+            ->select([
+                'u.id AS user_id',
+                'u.username',
+                'u.account_id',
+                'u.level_id',
+                'u.is_owner',
+                'u.youaudit',
+                'u.active',
+
+                'l.name AS level_name',
+
+                'a.name AS account_name',
+                'a.compliance AS safety_module',
+                'a.fault AS fault_module',
+                'a.service_module',
+                'a.reporting_module',
+                'a.condition_module',
+                'a.depreciation',
+                'a.fleet',
+                'a.active AS account_active',
+                'a.archive AS account_archive',
+            ])
+            ->join('levels l', 'l.id = u.level_id', 'left')
+            ->join('accounts a', 'a.id = u.account_id', 'left')
+            ->where('u.id', $userId)
+            ->where('u.active', 1)
+            ->get()
+            ->getRowArray();
+
+        if (!$user) {
+            return null;
+        }
+
+        $supplier = $this->db->table('supplier_user su')
+            ->select([
+                'su.supplier_id',
+                's.supplier_name',
+                's.type AS supplier_type',
+            ])
+            ->join(
+                'suppliers s',
+                's.supplier_id = su.supplier_id',
+                'left'
+            )
+            ->where('su.user_id', $userId)
+            ->get()
+            ->getRowArray();
+
+        $isSupplier = $supplier !== null;
+
+        return [
+            'user' => [
+                'id'          => (int) $user['user_id'],
+                'username'    => $user['username'],
+                'level_id'    => (int) $user['level_id'],
+                'level_name'  => $user['level_name'],
+                'is_owner'    => (bool) $user['is_owner'],
+                'is_supplier' => $isSupplier,
+            ],
+
+            'account' => [
+                'id'   => (int) $user['account_id'],
+                'name' => $user['account_name'],
+            ],
+
+            'modules' => [
+                'safety'       => (bool) $user['safety_module'],
+                'fault'        => (bool) $user['fault_module'],
+                'service'      => (int) $user['service_module'],
+                'reporting'    => (bool) $user['reporting_module'],
+                'condition'    => (bool) $user['condition_module'],
+                'depreciation' => (bool) $user['depreciation'],
+                'fleet'        => (bool) $user['fleet'],
+            ],
+        ];
+    }
+}

@@ -1,0 +1,81 @@
+<?php
+
+namespace App\Controllers\Api\V1;
+
+use App\Services\MfaChallengeService;
+
+class MfaController extends BaseApiController
+{
+    public function selectSetupMethod()
+    {
+        $data = $this->request->getJSON(true);
+
+        if (!is_array($data)) {
+            $data = $this->request->getPost();
+        }
+
+        $challengeToken = trim(
+            (string) ($data['challenge_token'] ?? '')
+        );
+
+        $method = trim(
+            (string) ($data['method'] ?? '')
+        );
+
+        if ($challengeToken === '' || $method === '') {
+            return $this->error(
+                'Challenge token and MFA method are required',
+                400
+            );
+        }
+
+        if (!in_array(
+            $method,
+            ['email', 'sms', 'authenticator'],
+            true
+        )) {
+            return $this->error(
+                'Invalid MFA method',
+                400
+            );
+        }
+
+        $challengeService = new MfaChallengeService();
+
+        $challenge = $challengeService->validateChallenge(
+            $challengeToken
+        );
+
+        if (!$challenge) {
+            return $this->error(
+                'Invalid or expired MFA challenge',
+                401
+            );
+        }
+
+        if ($challenge['challenge_type'] !== 'setup') {
+            return $this->error(
+                'This MFA challenge cannot be used for setup',
+                400
+            );
+        }
+
+        $updated = $challengeService->setSetupMethod(
+            (int) $challenge['id'],
+            $method
+        );
+
+        if (!$updated) {
+            return $this->error(
+                'Unable to select MFA method',
+                400
+            );
+        }
+
+        return $this->success([
+            'authentication_state' => 'mfa_setup_in_progress',
+            'method'               => $method,
+            'expires_at'           => $challenge['expires_at'],
+        ], 'MFA method selected');
+    }
+}

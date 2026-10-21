@@ -1,0 +1,113 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\UserMfaSettingModel;
+
+class MfaService
+{
+    private UserMfaSettingModel $mfaSettingModel;
+
+    public function __construct()
+    {
+        $this->mfaSettingModel = new UserMfaSettingModel();
+    }
+
+    public function getState(int $userId): array
+    {
+        $settings = $this->mfaSettingModel->findByUserId($userId);
+
+        if ($settings === null) {
+            return [
+                'state'   => 'not_configured',
+                'enabled' => false,
+                'method'  => null,
+            ];
+        }
+
+        if ((int) $settings['is_enabled'] !== 1) {
+            return [
+                'state'   => 'disabled',
+                'enabled' => false,
+                'method'  => null,
+            ];
+        }
+
+        $method = $settings['preferred_method'] ?? null;
+
+        if (!in_array(
+            $method,
+            ['authenticator', 'email', 'sms'],
+            true
+        )) {
+            return [
+                'state'   => 'invalid_configuration',
+                'enabled' => true,
+                'method'  => null,
+            ];
+        }
+
+        return [
+            'state'   => 'enabled',
+            'enabled' => true,
+            'method'  => $method,
+        ];
+    }
+
+    public function getSettings(int $userId): ?array
+    {
+        return $this->mfaSettingModel->findByUserId($userId);
+    }
+
+    public function completeOtpSetup(
+        int $userId,
+        string $method,
+        string $destination
+    ): bool {
+        if (!in_array($method, ['email', 'sms'], true)) {
+            throw new \InvalidArgumentException(
+                'Invalid OTP MFA method.'
+            );
+        }
+
+        $destination = trim($destination);
+
+        if ($destination === '') {
+            throw new \InvalidArgumentException(
+                'MFA destination is required.'
+            );
+        }
+
+        $now = date('Y-m-d H:i:s');
+
+        $existing = $this->mfaSettingModel
+            ->findByUserId($userId);
+
+        $data = [
+            'is_enabled'       => 1,
+            'preferred_method' => $method,
+            'updated_at'       => $now,
+        ];
+
+        if ($method === 'email') {
+            $data['email'] = $destination;
+            $data['mobile_number'] = null;
+        }
+
+        if ($method === 'sms') {
+            $data['mobile_number'] = $destination;
+            $data['email'] = null;
+        }
+
+        if ($existing === null) {
+            $data['user_id'] = $userId;
+            $data['created_at'] = $now;
+
+            return $this->mfaSettingModel
+                ->insert($data) !== false;
+        }
+
+        return $this->mfaSettingModel
+            ->update((int) $existing['id'], $data);
+    }
+}

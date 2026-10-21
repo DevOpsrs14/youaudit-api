@@ -1,0 +1,438 @@
+<?php
+
+namespace App\Controllers\Api\V1;
+
+use App\Services\MfaChallengeService;
+use App\Services\MfaOtpService;
+use App\Services\MfaService;
+use App\Services\SessionService;
+
+class MfaController extends BaseApiController
+{
+    public function selectSetupMethod()
+    {
+        $data = $this->request->getJSON(true);
+
+        if (!is_array($data)) {
+            $data = $this->request->getPost();
+        }
+
+        $challengeToken = trim(
+            (string) ($data['challenge_token'] ?? '')
+        );
+
+        $method = trim(
+            (string) ($data['method'] ?? '')
+        );
+
+        if ($challengeToken === '' || $method === '') {
+            return $this->error(
+                'Challenge token and MFA method are required',
+                400
+            );
+        }
+
+        if (!in_array(
+            $method,
+            ['email', 'sms', 'authenticator'],
+            true
+        )) {
+            return $this->error(
+                'Invalid MFA method',
+                400
+            );
+        }
+
+        $challengeService = new MfaChallengeService();
+
+        $challenge = $challengeService->validateChallenge(
+            $challengeToken
+        );
+
+        if (!$challenge) {
+            return $this->error(
+                'Invalid or expired MFA challenge',
+                401
+            );
+        }
+
+        if ($challenge['challenge_type'] !== 'setup') {
+            return $this->error(
+                'This MFA challenge cannot be used for setup',
+                400
+            );
+        }
+
+        $updated = $challengeService->setSetupMethod(
+            (int) $challenge['id'],
+            $method
+        );
+
+        if (!$updated) {
+            return $this->error(
+                'Unable to select MFA method',
+                400
+            );
+        }
+
+        return $this->success([
+            'authentication_state' => 'mfa_setup_in_progress',
+            'method'               => $method,
+            'expires_at'           => $challenge['expires_at'],
+        ], 'MFA method selected');
+    }
+
+    public function sendOtp()
+    {
+        $data = $this->request->getJSON(true);
+
+        if (!is_array($data)) {
+            $data = $this->request->getPost();
+        }
+
+        $challengeToken = trim(
+            (string) ($data['challenge_token'] ?? '')
+        );
+
+        $destination = trim(
+            (string) ($data['destination'] ?? '')
+        );
+
+        if ($challengeToken === '') {
+            return $this->error(
+                'Challenge token is required',
+                400
+            );
+        }
+
+        $challengeService = new MfaChallengeService();
+
+        $challenge = $challengeService->validateChallenge(
+            $challengeToken
+        );
+
+        if (!$challenge) {
+            return $this->error(
+                'Invalid or expired MFA challenge',
+                401
+            );
+        }
+
+        $challengeType = $challenge['challenge_type'] ?? null;
+        $method = $challenge['method'] ?? null;
+
+        if (!in_array(
+            $challengeType,
+            ['setup', 'verification'],
+            true
+        )) {
+            return $this->error(
+                'Invalid MFA challenge type',
+                400
+            );
+        }
+
+        if (!in_array($method, ['email', 'sms'], true)) {
+            return $this->error(
+                'OTP is not available for this MFA method',
+                400
+            );
+        }
+
+        /*
+         * First-time MFA setup:
+         * destination comes from the client because the user
+         * is configuring it for the first time.
+         */
+        if ($challengeType === 'setup') {
+            if ($destination === '') {
+                return $this->error(
+                    'MFA destination is required',
+                    400
+                );
+            }
+
+            if (
+                $method === 'email' &&
+                !filter_var($destination, FILTER_VALIDATE_EMAIL)
+            ) {
+                return $this->error(
+                    'A valid email address is required',
+                    400
+                );
+            }
+
+            if ($method === 'sms') {
+                $normalisedMobile = preg_replace(
+                    '/[\s\-\(\)]/',
+                    '',
+                    $destination
+                );
+
+                if (
+                    !preg_match(
+                        '/^\+?[0-9]{8,15}$/',
+                        $normalisedMobile
+                    )
+                ) {
+                    return $this->error(
+                        'A valid mobile number is required',
+                        400
+                    );
+                }
+
+                $destination = $normalisedMobile;
+            }
+        }
+
+        /*
+         * Returning-user MFA verification:
+         * NEVER trust a destination supplied by the client.
+         * Use the destination already stored in the user's
+         * MFA configuration.
+         */
+        if ($challengeType === 'verification') {
+            $mfaService = new MfaService();
+
+            $settings = $mfaService->getSettings(
+                (int) $challenge['user_id']
+            );
+
+            if (
+                !$settings ||
+                (int) ($settings['is_enabled'] ?? 0) !== 1
+            ) {
+                return $this->error(
+                    'MFA is not configured for this user',
+                    400
+                );
+            }
+
+            $configuredMethod =
+                $settings['preferred_method'] ?? null;
+
+            if ($configuredMethod !== $method) {
+                return $this->error(
+                    'MFA configuration does not match challenge',
+                    400
+                );
+            }
+
+            if ($method === 'email') {
+                $destination = trim(
+                    (string) ($settings['email'] ?? '')
+                );
+            }
+
+            if ($method === 'sms') {
+                $destination = trim(
+                    (string) ($settings['mobile_number'] ?? '')
+                );
+            }
+
+            if ($destination === '') {
+                return $this->error(
+                    'Configured MFA destination is unavailable',
+                    400
+                );
+            }
+        }
+
+        $otpService = new MfaOtpService();
+
+        $otp = $otpService->generateOtp(
+            (int) $challenge['id'],
+            $destination
+        );
+
+        /*
+         * DEVELOPMENT / TEST ONLY.
+         * Remove test_otp before production.
+         */
+        return $this->success([
+            'authentication_state' => 'mfa_otp_required',
+            'method'               => $method,
+            'expires_in'           => $otp['expires_in'],
+            'test_otp'             => $otp['otp'],
+        ], 'OTP generated for testing');
+    }
+
+    public function verifyOtp()
+    {
+        $data = $this->request->getJSON(true);
+
+        if (!is_array($data)) {
+            $data = $this->request->getPost();
+        }
+
+        $challengeToken = trim(
+            (string) ($data['challenge_token'] ?? '')
+        );
+
+        $otp = trim(
+            (string) ($data['otp'] ?? '')
+        );
+
+        $deviceName = isset($data['device_name'])
+            ? trim((string) $data['device_name'])
+            : null;
+
+        $platform = isset($data['platform'])
+            ? trim((string) $data['platform'])
+            : null;
+
+        $appVersion = isset($data['app_version'])
+            ? trim((string) $data['app_version'])
+            : null;
+
+        if ($challengeToken === '' || $otp === '') {
+            return $this->error(
+                'Challenge token and OTP are required',
+                400
+            );
+        }
+
+        if (!preg_match('/^[0-9]{6}$/', $otp)) {
+            return $this->error(
+                'OTP must be a 6-digit code',
+                400
+            );
+        }
+
+        $challengeService = new MfaChallengeService();
+
+        $verification = $challengeService->verifyOtp(
+            $challengeToken,
+            $otp
+        );
+
+        if (!$verification['success']) {
+            $reason = $verification['reason'] ?? 'invalid_otp';
+
+            if ($reason === 'invalid_challenge') {
+                return $this->error(
+                    'Invalid or expired MFA challenge',
+                    401
+                );
+            }
+
+            if ($reason === 'otp_expired') {
+                return $this->error(
+                    'OTP has expired',
+                    401
+                );
+            }
+
+            if ($reason === 'otp_not_generated') {
+                return $this->error(
+                    'OTP has not been generated',
+                    400
+                );
+            }
+
+            if ($reason === 'invalid_method') {
+                return $this->error(
+                    'OTP verification is not available for this MFA method',
+                    400
+                );
+            }
+
+            if ($reason === 'invalid_otp') {
+                return $this->error(
+                    'Invalid OTP',
+                    401,
+                    [
+                        'attempts_remaining' =>
+                            $verification['attempts_remaining'] ?? 0,
+                    ]
+                );
+            }
+
+            return $this->error(
+                'Unable to verify OTP',
+                400
+            );
+        }
+
+        $challenge = $verification['challenge'];
+
+        $challengeType =
+            $challenge['challenge_type'] ?? null;
+
+        if (!in_array(
+            $challengeType,
+            ['setup', 'verification'],
+            true
+        )) {
+            return $this->error(
+                'Invalid MFA challenge type',
+                400
+            );
+        }
+
+        $userId = (int) $challenge['user_id'];
+        $method = (string) $challenge['method'];
+
+        /*
+         * Only first-time setup should create/update
+         * the user's MFA configuration.
+         *
+         * A returning verification challenge must simply
+         * verify the existing configuration.
+         */
+        if ($challengeType === 'setup') {
+            $destination = trim(
+                (string) ($challenge['destination'] ?? '')
+            );
+
+            if ($destination === '') {
+                return $this->error(
+                    'MFA destination is missing',
+                    400
+                );
+            }
+
+            $mfaService = new MfaService();
+
+            $saved = $mfaService->completeOtpSetup(
+                $userId,
+                $method,
+                $destination
+            );
+
+            if (!$saved) {
+                return $this->error(
+                    'Unable to save MFA settings',
+                    500
+                );
+            }
+        }
+
+        $completed = $challengeService->completeChallenge(
+            (int) $challenge['id']
+        );
+
+        if (!$completed) {
+            return $this->error(
+                'Unable to complete MFA challenge',
+                500
+            );
+        }
+
+        $sessionService = new SessionService();
+
+        $session = $sessionService->createSession(
+            $userId,
+            $deviceName ?: null,
+            $platform ?: null,
+            $appVersion ?: null
+        );
+
+        return $this->success([
+            'authentication_state' => 'authenticated',
+            'token_type'           => 'Bearer',
+            'access_token'         => $session['token'],
+            'expires_at'           => $session['expires_at'],
+        ], 'MFA verified successfully');
+    }
+}
